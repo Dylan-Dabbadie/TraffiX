@@ -2195,14 +2195,12 @@ ui <- dashboardPage(
           border-color: var(--lift-border) !important;
         }
 
-        /* Live traffic layers are double-buffered (new group drawn before the
-           old one is cleared), which already avoids the blank flash from
-           clearGroup(). We intentionally do NOT fade new shapes in here: at
-           the current ~80ms frame interval, a fade-in animation longer than
-           the interval gets interrupted by the next frame before it
-           finishes, which reads as flicker/pulsing rather than smoothness. */
+        /* Live traffic layers are restyled in place (never cleared/redrawn), and
+           colour / width changes are eased so congestion fades smoothly between
+           animation frames instead of snapping. */
         .lift-map-frame .traffix-live-shape {
-          opacity: 1;
+          transition: stroke 0.12s linear, stroke-width 0.12s linear,
+                      fill 0.12s linear;
         }
         .lift-map-frame .leaflet-tooltip {
           border: 1px solid var(--lift-border) !important;
@@ -2804,6 +2802,59 @@ ui <- dashboardPage(
             if(href.indexOf('shiny-tab-network') !== -1){
               setTimeout(function(){ $(window).trigger('resize'); }, 120);
               setTimeout(function(){ $(window).trigger('resize'); }, 450);
+            }
+          });
+        });
+
+        // ---- Fast map animation: restyle existing layers instead of redrawing ----
+        $(function(){
+          var heads = {};
+          function arr(x){ return (x === null || x === undefined) ? [] : [].concat(x); }
+          function getMap(){
+            var w = window.HTMLWidgets && HTMLWidgets.find('#net_map');
+            return (w && w.getMap) ? w.getMap() : null;
+          }
+          function hook(l){
+            if(l.__tfx) return;
+            l.__tfx = true;
+            l.on('mouseover', function(){
+              l.__hover = true;
+              l.setStyle({color:'#182d23', weight:11, opacity:1});
+              if(l.bringToFront) l.bringToFront();
+            });
+            l.on('mouseout', function(){
+              l.__hover = false;
+              l.setStyle({color:l.__c, weight:l.__w, opacity:0.97});
+            });
+          }
+          Shiny.addCustomMessageHandler('traffix_heads', function(m){
+            heads = {};
+            var ids = arr(m.ids), h = arr(m.heads);
+            for(var i = 0; i < ids.length; i++){ heads[ids[i]] = h[i]; }
+          });
+          Shiny.addCustomMessageHandler('traffix_style', function(m){
+            var map = getMap();
+            if(!map || !map.layerManager) return;
+            var lm = map.layerManager;
+            var ids = arr(m.ids), col = arr(m.color), wt = arr(m.weight);
+            var dn = arr(m.dens), sp = arr(m.speed), fl = arr(m.flow);
+            for(var i = 0; i < ids.length; i++){
+              var l = lm.getLayer('shape', ids[i]);
+              if(!l) continue;
+              hook(l);
+              l.__c = col[i]; l.__w = wt[i];
+              if(!l.__hover) l.setStyle({color:col[i], weight:wt[i]});
+              if(heads[ids[i]] !== undefined && l.setTooltipContent){
+                l.setTooltipContent(heads[ids[i]] + '<br>Density: ' + dn[i] + '% of jam' +
+                  '<br>Speed: ' + sp[i] + ' km/h' + '<br>FD flow potential: ' + fl[i] + ' veh/h');
+              }
+            }
+            var nid = arr(m.node_ids), nf = arr(m.node_fill), nr = arr(m.node_radius), hr = arr(m.halo_radius);
+            for(var k = 0; k < nid.length; k++){
+              var n = lm.getLayer('marker', nid[k]);
+              if(n){ n.setStyle({fillColor:nf[k]}); n.setRadius(nr[k]); }
+              var h = lm.getLayer('marker', 'halo_' + (k + 1));
+              if(h){ h.setStyle({fillColor:nf[k]}); h.setRadius(hr[k]); }
             }
           });
         });
@@ -3821,34 +3872,60 @@ server <- function(input, output, session) {
     )
   })
 
+  # Playhead kept on the server so animation frames no longer wait for a slider
+  # round-trip. The slider is only refreshed occasionally, for display.
+  t_play <- reactiveVal(0)
+  anim_state <- new.env(parent = emptyenv())
+  anim_state$last <- NULL
+  anim_state$n <- 0L
+
+  # User dragging the slider moves the playhead. While animating, small
+  # differences are just the slider echoing an older playhead value.
+  observeEvent(input$t_scrub, {
+    v <- as.numeric(input$t_scrub)
+    s <- tryCatch(sim_result(), error = function(e) NULL)
+    tol <- if (is.null(s)) 0 else 0.08 * (max(s$time_axis) - min(s$time_axis))
+    if (!isTRUE(input$animate) || abs(v - t_play()) > tol) t_play(v)
+  }, ignoreInit = TRUE)
+
   observe({
-    if (isTRUE(input$animate)) {
-      s <- sim_result(); req(s)
-      isolate({
-        cur <- input$t_scrub %||% 0
-
-        # Pace playback so a full corridor loop takes ~12 real-world seconds
-        # regardless of dt, instead of tying the frame step to dt/2 (which,
-        # for a 10-minute simulation, made a full loop take well over two
-        # minutes and feel like nothing was happening).
-        target_loop_s <- 24
-        frame_interval_ms <- 80
-        target_frames <- (target_loop_s * 1000) / frame_interval_ms
-        sim_span <- max(s$time_axis) - min(s$time_axis)
-        frame_step <- max(s$dt, sim_span / target_frames)
-
-        nxt <- cur + frame_step
-        if (nxt > max(s$time_axis)) nxt <- 0
-
-        updateSliderInput(session, "t_scrub", value = nxt)
-      })
-      invalidateLater(80, session)
+    if (!isTRUE(input$animate)) {
+      anim_state$last <- NULL
+      return()
     }
+    s <- sim_result(); req(s)
+    isolate({
+      now <- proc.time()[["elapsed"]]
+      elapsed <- if (is.null(anim_state$last)) 0 else min(now - anim_state$last, 0.5)
+      anim_state$last <- now
+
+      # One full corridor loop takes target_loop_s real seconds, paced by the
+      # wall clock so it stays the same speed even if a frame is slow.
+      target_loop_s <- 24
+      t_min <- min(s$time_axis); t_max <- max(s$time_axis)
+      span <- t_max - t_min
+      nxt <- t_play() + span / target_loop_s * elapsed
+      if (nxt > t_max) nxt <- t_min + (nxt - t_max) %% span
+      t_play(nxt)
+
+      anim_state$n <- anim_state$n + 1L
+      if (anim_state$n %% 5L == 0L) {
+        updateSliderInput(session, "t_scrub", value = round(nxt, 1))
+      }
+    })
+    invalidateLater(100, session)
   })
 
+  # When playback stops, sync the slider to the exact playhead.
+  observeEvent(input$animate, {
+    if (!isTRUE(input$animate)) {
+      updateSliderInput(session, "t_scrub", value = round(t_play(), 1))
+    }
+  }, ignoreInit = TRUE)
+
   current_idx <- reactive({
-    s <- sim_result(); req(s, input$t_scrub)
-    idx <- which.min(abs(s$time_axis - input$t_scrub))
+    s <- sim_result(); req(s)
+    idx <- which.min(abs(s$time_axis - t_play()))
     idx
   })
 
@@ -3860,7 +3937,7 @@ server <- function(input, output, session) {
     if (!is.null(s)) {
       # Interpolate between adjacent simulation states. The playback slider can
       # now move at half-dt increments, so this prevents visible state jumps.
-      tcur <- as.numeric(input$t_scrub %||% 0)
+      tcur <- as.numeric(t_play())
       tcur <- max(min(tcur, max(s$time_axis)), min(s$time_axis))
 
       hi <- which(s$time_axis >= tcur)[1]
@@ -4141,7 +4218,7 @@ server <- function(input, output, session) {
     node_col <- ifelse(role == "source", "#0FB5AE", ifelse(role == "sink", "#8E44AD", "#0B5FA5"))
 
     if (!is.null(s) && isTRUE(s$signalize)) {
-      tsec <- as.numeric(input$t_scrub %||% 0)
+      tsec <- as.numeric(t_play())
       green <- (tsec %% s$cycle_length) < (s$green_split * s$cycle_length)
       node_col <- ifelse(
         role == "junction",
@@ -4416,146 +4493,122 @@ server <- function(input, output, session) {
     div(class = "lift-map-selection empty", "Hover over a road link or node to inspect its live state. Tap also works on touch devices.")
   })
 
-  # Alternate between two layer groups. Each new frame is fully drawn before
-  # the old frame is removed, so users never see a blank map between updates.
-  active_traffic_frame <- reactiveVal("Traffic frame B")
-
+  # The road cells and nodes are drawn ONCE (and again only if the simulation
+  # is recomputed). Animation frames then just restyle those existing layers in
+  # the browser, so nothing is cleared or redrawn: no flashing, and far less
+  # data sent per frame.
   observe({
-    ns <- net_state()
-    n <- net()
+    s_now <- tryCatch(sim_result(), error = function(e) NULL)
+    ns <- isolate(net_state())
+    n <- isolate(net())
     g <- n$graph
     ll <- lynnwood_node_positions(vcount(g))
     el <- ns$el
-    role <- ns$role
 
-    # Read the current buffer without creating a reactive dependency on it.
-    # Otherwise this observer would invalidate itself every time it switches
-    # A <-> B and keep the entire Shiny session permanently busy.
-    old_group <- isolate(active_traffic_frame())
-    new_group <- if (identical(old_group, "Traffic frame A")) {
-      "Traffic frame B"
-    } else {
-      "Traffic frame A"
-    }
-    frame_suffix <- if (identical(new_group, "Traffic frame A")) "A" else "B"
-
-    # Congestion around each node is the mean density of its incident links.
     node_density <- vapply(seq_len(vcount(g)), function(v) {
       ie <- as.integer(incident(g, v, mode = "all"))
-      if (length(ie) == 0) {
-        0
-      } else {
-        mean(ns$edge_density[ie], na.rm = TRUE)
-      }
+      if (length(ie) == 0) 0 else mean(ns$edge_density[ie], na.rm = TRUE)
     }, numeric(1))
     node_density[!is.finite(node_density)] <- 0
     node_intensity <- pmax(0, pmin(1, node_density / 0.50))
 
-    proxy <- leafletProxy("net_map")
+    proxy <- leafletProxy("net_map") %>%
+      clearGroup("Traffic cells") %>%
+      clearGroup("Traffic nodes")
 
-    # Draw each CTM cell separately. This reveals the queue front moving
-    # through a road link instead of hiding it inside one link-average colour.
+    # Build all cell geometry in one pass, then add each cell once.
+    cell_ids <- character(0)
+    cell_heads <- character(0)
     for (i in seq_len(nrow(el))) {
       line_df <- lynnwood_edge_path(
-        from_node = el[i, 1],
-        to_node = el[i, 2],
-        n_nodes = vcount(g)
+        from_node = el[i, 1], to_node = el[i, 2], n_nodes = vcount(g)
       )
-
-      cell_paths <- split_road_path_into_cells(
-        line_df,
-        ncol(ns$cell_density)
-      )
+      cell_paths <- split_road_path_into_cells(line_df, ncol(ns$cell_density))
 
       for (j in seq_along(cell_paths)) {
-        cell_df <- cell_paths[[j]]
-
-        label_html <- paste0(
-          "<b>Link ", i, " · Cell ", j,
-          " · N", el[i, 1], " → N", el[i, 2], "</b>",
-          "<br>Density: ",
-          round(ns$cell_density[i, j] * 100, 1),
-          "% of jam",
-          "<br>Speed: ",
-          round(ns$cell_speed[i, j], 1),
-          " km/h",
-          "<br>FD flow potential: ",
-          round(ns$cell_flow[i, j]),
-          " veh/h"
+        id <- paste0("link_", i, "_cell_", j)
+        head <- paste0(
+          "<b>Link ", i, " \u00b7 Cell ", j,
+          " \u00b7 N", el[i, 1], " \u2192 N", el[i, 2], "</b>"
         )
+        cell_ids <- c(cell_ids, id)
+        cell_heads <- c(cell_heads, head)
 
         proxy <- proxy %>%
           addPolylines(
-            data = cell_df,
-            lng = ~lon,
-            lat = ~lat,
-            layerId = paste0(
-              "link_", i,
-              "_cell_", j,
-              "__", frame_suffix
-            ),
+            data = cell_paths[[j]], lng = ~lon, lat = ~lat,
+            layerId = id,
             color = ns$cell_col[i, j],
-            weight = 4.5 +
-              8.5 * ns$cell_density_intensity[i, j],
+            weight = 4.5 + 8.5 * ns$cell_density_intensity[i, j],
             opacity = 0.97,
-            group = new_group,
-            label = HTML(label_html),
-            options = pathOptions(
-              className = "traffix-live-shape"
-            ),
-            highlightOptions = highlightOptions(
-              weight = 11,
-              color = "#182d23",
-              opacity = 1,
-              bringToFront = TRUE
-            )
+            group = "Traffic cells",
+            label = HTML(paste0(
+              head,
+              "<br>Density: ", round(ns$cell_density[i, j] * 100, 1), "% of jam",
+              "<br>Speed: ", round(ns$cell_speed[i, j], 1), " km/h",
+              "<br>FD flow potential: ", round(ns$cell_flow[i, j]), " veh/h"
+            )),
+            options = pathOptions(className = "traffix-live-shape")
           )
       }
     }
 
-    # Node halos and markers are also double-buffered.
     proxy <- proxy %>%
       addCircleMarkers(
-        lng = ll$lon,
-        lat = ll$lat,
+        lng = ll$lon, lat = ll$lat,
+        layerId = paste0("halo_", seq_len(vcount(g))),
         radius = 11 + 13 * node_intensity,
         stroke = FALSE,
-        fillColor = ns$node_col,
-        fillOpacity = 0.13,
-        group = new_group,
-        options = pathOptions(
-          interactive = FALSE,
-          className = "traffix-live-shape"
-        )
+        fillColor = ns$node_col, fillOpacity = 0.13,
+        group = "Traffic nodes",
+        options = pathOptions(interactive = FALSE, className = "traffix-live-shape")
       ) %>%
       addCircleMarkers(
-        lng = ll$lon,
-        lat = ll$lat,
-        layerId = paste0(
-          "node_",
-          seq_len(vcount(g)),
-          "__",
-          frame_suffix
-        ),
+        lng = ll$lon, lat = ll$lat,
+        layerId = paste0("node_", seq_len(vcount(g))),
         radius = 7 + 5 * node_intensity,
-        color = "#ffffff",
-        weight = 2,
-        fillColor = ns$node_col,
-        fillOpacity = 0.98,
-        group = new_group,
-        label = paste0(
-          "N", V(g)$name,
-          " · ", toupper(role)
-        ),
-        options = pathOptions(
-          className = "traffix-live-shape"
-        )
-      ) %>%
-      clearGroup(old_group)
+        color = "#ffffff", weight = 2,
+        fillColor = ns$node_col, fillOpacity = 0.98,
+        group = "Traffic nodes",
+        label = paste0("N", V(g)$name, " \u00b7 ", toupper(ns$role)),
+        options = pathOptions(className = "traffix-live-shape")
+      )
 
-    # Update the buffer pointer. Because the read above is isolated, this
-    # does NOT retrigger the observer by itself.
-    active_traffic_frame(new_group)
+    session$sendCustomMessage("traffix_heads", list(ids = cell_ids, heads = cell_heads))
+  })
+
+  # Per-frame update: only small numeric vectors are sent to the browser.
+  observe({
+    ns <- net_state()
+    g <- ns$g
+    n_nodes <- vcount(g)
+    n_cells <- ncol(ns$cell_density)
+    el <- ns$el
+
+    # Same ordering as the draw observer: link i, then cell j.
+    ids <- as.vector(t(outer(seq_len(nrow(el)), seq_len(n_cells),
+                             function(i, j) paste0("link_", i, "_cell_", j))))
+    flat <- function(m) as.vector(t(m))
+
+    node_density <- vapply(seq_len(n_nodes), function(v) {
+      ie <- as.integer(incident(g, v, mode = "all"))
+      if (length(ie) == 0) 0 else mean(ns$edge_density[ie], na.rm = TRUE)
+    }, numeric(1))
+    node_density[!is.finite(node_density)] <- 0
+    node_intensity <- pmax(0, pmin(1, node_density / 0.50))
+
+    session$sendCustomMessage("traffix_style", list(
+      ids = ids,
+      color = flat(ns$cell_col),
+      weight = round(4.5 + 8.5 * flat(ns$cell_density_intensity), 2),
+      dens = round(flat(ns$cell_density) * 100, 1),
+      speed = round(flat(ns$cell_speed), 1),
+      flow = round(flat(ns$cell_flow)),
+      node_ids = paste0("node_", seq_len(n_nodes)),
+      node_fill = ns$node_col,
+      node_radius = round(7 + 5 * node_intensity, 2),
+      halo_radius = round(11 + 13 * node_intensity, 2)
+    ))
   })
 
   # Legends only depend on the selected metric. They no longer get destroyed
@@ -4636,7 +4689,7 @@ server <- function(input, output, session) {
     s <- tryCatch(sim_result(), error = function(e) NULL)
     req(s)
 
-    tcur <- as.numeric(input$t_scrub %||% 0)
+    tcur <- as.numeric(t_play())
     tcur <- max(min(tcur, max(s$time_axis)), min(s$time_axis))
 
     hi <- which(s$time_axis >= tcur)[1]
