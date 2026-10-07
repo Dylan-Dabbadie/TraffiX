@@ -153,6 +153,15 @@ LYNNWOOD_BBOX <- c(
 TRAFFIX_CACHE_DIR <- file.path(path.expand("~"), ".traffix")
 TRAFFIX_ROUTE_CACHE <- file.path(TRAFFIX_CACHE_DIR, "lynnwood_road_centreline_v1.rds")
 
+# Cloud-safe, deployment-bundled copy of the verified road geometry.
+# When this file is present next to app.R it is part of the deployed content,
+# so a fresh Connect Cloud worker does not need a writable home cache or a
+# successful Overpass request.
+TRAFFIX_BUNDLED_ROUTE <- file.path(
+  getwd(),
+  "lynnwood_road_centreline_v1.rds"
+)
+
 ensure_traffix_cache_dir <- function() {
   if (!dir.exists(TRAFFIX_CACHE_DIR)) {
     dir.create(TRAFFIX_CACHE_DIR, recursive = TRUE, showWarnings = FALSE)
@@ -171,6 +180,38 @@ validate_lynnwood_centreline <- function(x) {
     min(x$lat) >= -25.7705 &&
     max(x$lat) <= -25.7520 &&
     diff(range(x$lon)) >= 0.040
+}
+
+read_bundled_lynnwood_centreline <- function() {
+  if (!file.exists(TRAFFIX_BUNDLED_ROUTE)) return(NULL)
+
+  out <- tryCatch(
+    readRDS(TRAFFIX_BUNDLED_ROUTE),
+    error = function(e) NULL
+  )
+
+  if (!validate_lynnwood_centreline(out)) return(NULL)
+
+  attr(out, "route_source") <-
+    "bundled OpenStreetMap · Lynnwood Road geometry"
+  out
+}
+
+save_bundled_lynnwood_centreline <- function(x) {
+  if (!validate_lynnwood_centreline(x)) return(FALSE)
+
+  out <- x[, c("lat", "lon"), drop = FALSE]
+
+  tryCatch({
+    saveRDS(out, TRAFFIX_BUNDLED_ROUTE)
+    TRUE
+  }, error = function(e) {
+    message(
+      "TraffiX map: could not write project-bundled Lynnwood geometry: ",
+      conditionMessage(e)
+    )
+    FALSE
+  })
 }
 
 read_cached_lynnwood_centreline <- function() {
@@ -345,24 +386,57 @@ fallback_lynnwood_centreline <- function() {
 }
 
 # Route boot sequence ---------------------------------------------------------
-# A verified local copy wins. This makes the map deterministic after the first
-# successful OSM lookup.
-LYNNWOOD_ROUTE <- read_cached_lynnwood_centreline()
+#
+# Order of preference:
+#   1. project-bundled verified geometry (best for Connect Cloud);
+#   2. local ~/.traffix cache (useful during local development);
+#   3. live Overpass lookup;
+#   4. emergency built-in fallback.
+#
+# IMPORTANT: when a successful cached or live route is found locally, TraffiX
+# also writes the same verified geometry to the project folder as:
+#   lynnwood_road_centreline_v1.rds
+#
+# Publish that file together with app.R. Connect Cloud will then load it first
+# on every fresh worker and will not need Overpass for the road alignment.
+LYNNWOOD_ROUTE <- read_bundled_lynnwood_centreline()
+
+if (is.null(LYNNWOOD_ROUTE)) {
+  LYNNWOOD_ROUTE <- read_cached_lynnwood_centreline()
+
+  if (!is.null(LYNNWOOD_ROUTE)) {
+    bundled_saved <- save_bundled_lynnwood_centreline(LYNNWOOD_ROUTE)
+
+    if (bundled_saved) {
+      message(
+        "TraffiX map: copied verified Lynnwood geometry from ~/.traffix ",
+        "into the app project as lynnwood_road_centreline_v1.rds"
+      )
+    }
+  }
+}
 
 if (is.null(LYNNWOOD_ROUTE)) {
   LYNNWOOD_ROUTE <- tryCatch(
     {
       route <- fetch_lynnwood_osm_centreline()
-      saved <- save_cached_lynnwood_centreline(route)
-      if (saved) {
+
+      cached_saved <- save_cached_lynnwood_centreline(route)
+      bundled_saved <- save_bundled_lynnwood_centreline(route)
+
+      if (bundled_saved) {
+        attr(route, "route_source") <-
+          "OpenStreetMap · Lynnwood Road geometry · bundled for deployment"
+      } else if (cached_saved) {
         attr(route, "route_source") <-
           "OpenStreetMap · Lynnwood Road geometry · cached locally"
       }
+
       route
     },
     error = function(e) {
       message(
-        "TraffiX map: no cached road geometry and OSM lookup failed: ",
+        "TraffiX map: no bundled/cached road geometry and OSM lookup failed: ",
         conditionMessage(e)
       )
       fallback_lynnwood_centreline()
@@ -3739,10 +3813,10 @@ server <- function(input, output, session) {
   if (grepl("emergency built-in", LYNNWOOD_ROUTE_SOURCE, fixed = TRUE)) {
     showNotification(
       paste0(
-        "Lynnwood Road geometry could not be retrieved on this launch and no ",
-        "verified local cache exists yet. Re-run TraffiX once while connected ",
-        "to the internet; the successful road geometry will then be saved and ",
-        "reused permanently."
+        "Lynnwood Road geometry could not be loaded from the bundled project ",
+        "file or local cache, and the live OSM lookup failed. Run TraffiX ",
+        "locally once with the verified cache available, then publish ",
+        "lynnwood_road_centreline_v1.rds together with app.R."
       ),
       type = "warning",
       duration = 12
