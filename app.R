@@ -845,15 +845,107 @@ ui <- dashboardPage(
 
         /* Top navigation */
         .lift-nav {
+          position: relative;
           display: flex;
           gap: 3px;
           flex-wrap: wrap;
           margin-bottom: 22px;
-          padding: 4px;
+          padding: 28px 4px 4px;
           background: var(--lift-white);
           border: 1px solid var(--lift-border);
           border-radius: 8px;
+          overflow: visible;
         }
+        .lift-nav::before {
+          content: "";
+          position: absolute;
+          left: 10px;
+          right: 10px;
+          top: 16px;
+          height: 2px;
+          border-radius: 999px;
+          background: repeating-linear-gradient(
+            90deg,
+            rgba(166,157,144,.72) 0 18px,
+            transparent 18px 27px
+          );
+          pointer-events: none;
+        }
+        .traffix-nav-car {
+          position: absolute;
+          left: 0;
+          top: 0;
+          width: 38px;
+          height: 21px;
+          z-index: 5;
+          pointer-events: none;
+          transform: translate3d(8px, 2px, 0);
+          transition: transform .72s cubic-bezier(.22, 1, .36, 1);
+          will-change: transform;
+        }
+        .traffix-nav-car.no-transition { transition: none !important; }
+        .traffix-nav-car-vehicle {
+          position: absolute;
+          inset: 0;
+          transform-origin: 50% 80%;
+        }
+        .traffix-nav-car-body {
+          position: absolute;
+          left: 2px;
+          right: 2px;
+          bottom: 5px;
+          height: 10px;
+          border-radius: 7px 8px 4px 4px;
+          background: var(--lift-warm);
+          border: 1px solid rgba(24,45,35,.28);
+          box-shadow: 0 3px 7px rgba(24,45,35,.18);
+        }
+        .traffix-nav-car-cabin {
+          position: absolute;
+          left: 10px;
+          bottom: 13px;
+          width: 19px;
+          height: 7px;
+          border-radius: 8px 8px 2px 2px;
+          background: var(--lift-teal);
+          border: 1px solid rgba(24,45,35,.18);
+          clip-path: polygon(17% 100%, 31% 8%, 73% 8%, 91% 100%);
+        }
+        .traffix-nav-wheel {
+          position: absolute;
+          bottom: 1px;
+          width: 7px;
+          height: 7px;
+          border-radius: 50%;
+          background: var(--lift-ink);
+          border: 1px solid rgba(255,255,255,.34);
+        }
+        .traffix-nav-wheel::after {
+          content: "";
+          position: absolute;
+          left: 2px;
+          top: 2px;
+          width: 1px;
+          height: 3px;
+          border-radius: 2px;
+          background: var(--lift-bg);
+          opacity: .65;
+        }
+        .traffix-nav-wheel.front { right: 6px; }
+        .traffix-nav-wheel.rear { left: 7px; }
+        .traffix-nav-car.moving .traffix-nav-car-vehicle {
+          animation: traffixNavCarPitch .72s cubic-bezier(.22, 1, .36, 1);
+        }
+        .traffix-nav-car.moving .traffix-nav-wheel {
+          animation: traffixNavWheelSpin .28s linear infinite;
+        }
+        @keyframes traffixNavCarPitch {
+          0%   { transform: translateY(0) rotate(0deg); }
+          22%  { transform: translateY(-2px) rotate(-2deg); }
+          58%  { transform: translateY(-1px) rotate(1.2deg); }
+          100% { transform: translateY(0) rotate(0deg); }
+        }
+        @keyframes traffixNavWheelSpin { to { transform: rotate(360deg); } }
         .lift-nav-link {
           display: inline-flex;
           align-items: center;
@@ -870,6 +962,11 @@ ui <- dashboardPage(
         }
         .lift-nav-link:hover { color: var(--lift-ink) !important; background: #f6f1e8; }
         .lift-nav-link.active { color: var(--lift-bg) !important; background: var(--lift-ink); }
+        @media (prefers-reduced-motion: reduce) {
+          .traffix-nav-car { transition: none !important; }
+          .traffix-nav-car.moving .traffix-nav-car-vehicle,
+          .traffix-nav-car.moving .traffix-nav-wheel { animation: none !important; }
+        }
 
         /* Shared card system */
         .lift-card {
@@ -2838,45 +2935,84 @@ ui <- dashboardPage(
           }
           .lift-header-top { flex-direction: column; gap: 4px; }
           .lift-title { font-size: 34px; }
+          .lift-nav { padding-top: 4px; }
+          .lift-nav::before, .traffix-nav-car { display: none; }
           .lift-nav-link { padding: 8px 10px; }
           .lift-run-wrap { flex-direction: column; align-items: stretch; }
           .setup-intro { align-items: flex-start; flex-direction: column; }
         }
       ')),
 
-      # Keep the custom top-navigation highlight and Shiny tab state in sync.
+      # Keep the custom top-navigation highlight, moving car and Shiny tab state in sync.
       tags$script(HTML("
         $(document).on('shiny:connected', function(){
-          function syncLiftNav(tabName){
+          var liftCarTimer = null;
+          var currentLiftTab = 'home';
+
+          function moveLiftCar(tabName, instant){
+            var nav = document.querySelector('.lift-nav');
+            if(!nav) return;
+
+            var car = nav.querySelector('.traffix-nav-car');
+            var link = nav.querySelector('.lift-nav-link[data-tab=\"' + tabName + '\"]');
+            if(!car || !link || window.innerWidth <= 640) return;
+
+            var navRect = nav.getBoundingClientRect();
+            var linkRect = link.getBoundingClientRect();
+            var carWidth = car.offsetWidth || 38;
+            var carHeight = car.offsetHeight || 21;
+            var x = linkRect.left - navRect.left + (linkRect.width - carWidth) / 2;
+            var y = linkRect.top - navRect.top - carHeight - 3;
+            y = Math.max(2, y);
+
+            if(instant){ car.classList.add('no-transition'); }
+            car.style.transform = 'translate3d(' + x + 'px,' + y + 'px,0)';
+
+            if(instant){
+              requestAnimationFrame(function(){
+                requestAnimationFrame(function(){ car.classList.remove('no-transition'); });
+              });
+            } else {
+              car.classList.remove('moving');
+              void car.offsetWidth;
+              car.classList.add('moving');
+              clearTimeout(liftCarTimer);
+              liftCarTimer = setTimeout(function(){ car.classList.remove('moving'); }, 760);
+            }
+          }
+
+          function syncLiftNav(tabName, instant){
             if(!tabName){
               tabName = $('.sidebar-menu .active a').attr('data-value') ||
                         $('.tab-content .tab-pane.active').attr('id');
               if(tabName){ tabName = tabName.replace('shiny-tab-', ''); }
               tabName = tabName || 'home';
             }
+            currentLiftTab = tabName;
             $('.lift-nav-link').removeClass('active');
             $('.lift-nav-link[data-tab=\"' + tabName + '\"]').addClass('active');
+            moveLiftCar(tabName, !!instant);
           }
 
-          syncLiftNav();
+          setTimeout(function(){ syncLiftNav(null, true); }, 40);
 
-          // Fires whenever the real Shiny tab input changes.
           $(document).on('shiny:inputchanged', function(event){
-            if(event.name === 'tabs'){
-              syncLiftNav(event.value);
-            }
+            if(event.name === 'tabs'){ syncLiftNav(event.value, false); }
           });
 
-          // Backup for Bootstrap/shinydashboard tab transitions.
-          // visNetwork can calculate a zero-size canvas when its tab was hidden;
-          // trigger a browser resize as soon as the Network tab becomes visible.
           $(document).on('shown.bs.tab', function(e){
-            setTimeout(syncLiftNav, 10);
+            setTimeout(function(){ syncLiftNav(null, false); }, 10);
             var href = $(e.target).attr('href') || '';
             if(href.indexOf('shiny-tab-network') !== -1){
               setTimeout(function(){ $(window).trigger('resize'); }, 120);
               setTimeout(function(){ $(window).trigger('resize'); }, 450);
             }
+          });
+
+          var liftResizeTimer = null;
+          $(window).on('resize.traffixNavCar', function(){
+            clearTimeout(liftResizeTimer);
+            liftResizeTimer = setTimeout(function(){ moveLiftCar(currentLiftTab, true); }, 80);
           });
         });
 
@@ -2951,6 +3087,16 @@ ui <- dashboardPage(
       # These controls send the selected tab to Shiny so the page and the
       # highlighted navigation item always stay synchronized.
       tags$nav(class = "lift-nav", role = "navigation",
+        div(
+          class = "traffix-nav-car",
+          `aria-hidden` = "true",
+          div(class = "traffix-nav-car-vehicle",
+            div(class = "traffix-nav-car-body"),
+            div(class = "traffix-nav-car-cabin"),
+            span(class = "traffix-nav-wheel rear"),
+            span(class = "traffix-nav-wheel front")
+          )
+        ),
         tags$a(class = "lift-nav-link active", href = "#", `data-tab` = "home",
                onclick = "Shiny.setInputValue('lift_nav', 'home', {priority: 'event'}); return false;",
                icon("house"), "Overview"),
