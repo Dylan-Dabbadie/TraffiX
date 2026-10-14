@@ -5221,14 +5221,11 @@ server <- function(input, output, session) {
     display_df$`Max density (veh/km)` <- round(display_df$`Max density (veh/km)`, 1)
     display_df$`Avg speed (km/h)` <- round(display_df$`Avg speed (km/h)`, 1)
 
-    datatable(display_df, options = list(pageLength = 8, dom = "tip"), rownames = FALSE) %>%
-      formatStyle(
-        "Avg density (veh/km)",
-        background = styleColorBar(
-          range(display_df$`Avg density (veh/km)`, na.rm = TRUE),
-          "#F5A62366"
-        )
-      )
+    datatable(
+      display_df,
+      options = list(pageLength = 8, dom = "tip"),
+      rownames = FALSE
+    )
   })
 }
 
